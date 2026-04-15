@@ -1,8 +1,8 @@
 const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || "4000", 10);
-// Delay between each yap message in milliseconds (default: 3 seconds)
-const YAP_DELAY = parseInt(process.env.YAP_DELAY || "3000", 10);
+// Delay between each yap message in milliseconds (default: 30 seconds)
+let yapDelay = parseInt(process.env.YAP_DELAY || "30000", 10);
 
 if (!TOKEN || !CHANNEL_ID) {
   console.error("Missing DISCORD_TOKEN or CHANNEL_ID env vars");
@@ -52,7 +52,7 @@ function scheduleNextYap() {
     await sendMessage(yapChannelId, content);
     yapIndex = (yapIndex + 1) % ALL_MESSAGES.length; // cycle back after 100
     scheduleNextYap();
-  }, YAP_DELAY);
+  }, yapDelay);
 }
 
 // Start the yap loop in the given channel
@@ -112,6 +112,17 @@ async function pollCommands() {
       } else if (text === "!off") {
         console.log(`📥 !off received from ${msg.author.username}`);
         stopYap();
+      } else if (text.startsWith("!cooldown ")) {
+        const arg = text.slice("!cooldown ".length).trim();
+        const seconds = parseInt(arg, 10);
+        if (!Number.isInteger(seconds) || seconds <= 0 || String(seconds) !== arg) {
+          console.log(`⚠️ Invalid !cooldown value from ${msg.author.username}: "${arg}"`);
+          await sendMessage(msg.channel_id, `❌ Invalid cooldown. Usage: \`!cooldown <positive integer>\` (seconds)`);
+        } else {
+          yapDelay = seconds * 1000;
+          console.log(`⏱️ Cooldown updated to ${seconds}s (${yapDelay}ms) by ${msg.author.username}`);
+          await sendMessage(msg.channel_id, `✅ Cooldown set to **${seconds} seconds**. Applies to the next scheduled message.`);
+        }
       }
     }
   } catch (err) {
@@ -173,7 +184,7 @@ async function poll() {
 
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
 console.log(`🚀 Auto-reactor started — watching channel ${CHANNEL_ID}`);
-console.log(`💬 Yap feature ready — send !on to start, !off to stop (delay: ${YAP_DELAY}ms)`);
+console.log(`💬 Yap feature ready — send !on to start, !off to stop (delay: ${yapDelay}ms)`);
 
 // Seed lastSeenCommandId with the latest message so we don't replay history
 (async () => {
