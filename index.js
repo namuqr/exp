@@ -47,7 +47,7 @@ function scheduleNextYap() {
   yapTimeout = setTimeout(async () => {
     if (!yapActive) return;
     const msgNumber = yapIndex + 1; // 1-based for logging
-    const content = `**[${msgNumber}/100]** ${ALL_MESSAGES[yapIndex]}`;
+    const content = ALL_MESSAGES[yapIndex];
     console.log(`💬 Yap #${msgNumber} → channel ${yapChannelId}`);
     await sendMessage(yapChannelId, content);
     yapIndex = (yapIndex + 1) % ALL_MESSAGES.length; // cycle back after 100
