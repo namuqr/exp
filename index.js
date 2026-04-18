@@ -1,59 +1,43 @@
 const WebSocket = require("ws");
 
-const TOKEN = process.env.DISCORD_TOKEN;
+// ─── Configuration ────────────────────────────────────────────────────────────
 const CHANNEL_ID = process.env.CHANNEL_ID;
 // Delay between each yap message in milliseconds (default: 30 seconds)
 let yapDelay = parseInt(process.env.YAP_DELAY || "30000", 10);
 
-if (!TOKEN || !CHANNEL_ID) {
-  console.error("Missing DISCORD_TOKEN or CHANNEL_ID env vars");
+// Parse DISCORD_TOKENS as a JSON array of token strings
+let TOKENS;
+try {
+  TOKENS = JSON.parse(process.env.DISCORD_TOKENS || "[]");
+  if (!Array.isArray(TOKENS) || TOKENS.length === 0) throw new Error("empty");
+} catch {
+  console.error(
+    "Missing or invalid DISCORD_TOKENS env var.\n" +
+    'Expected a JSON array, e.g.: ["token1","token2","token3"]'
+  );
+  process.exit(1);
+}
+
+if (!CHANNEL_ID) {
+  console.error("Missing CHANNEL_ID env var");
   process.exit(1);
 }
 
 const { ALL_MESSAGES } = require("./messages.js");
 
-// ─── Discord REST helpers ─────────────────────────────────────────────────────
-const API_BASE = "https://discord.com/api/v10";
+// ─── Shared state (all clients read/write these together) ─────────────────────
+const handled = new Set();   // reaction combo keys already processed
 
-async function discordRequest(method, path, body) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method,
-    headers: {
-      Authorization: TOKEN,
-      "Content-Type": "application/json",
-      "User-Agent": "DiscordBot (custom, 1.0)",
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Discord API ${method} ${path} → ${res.status}: ${text}`);
-  }
-  // 204 No Content has no body
-  if (res.status === 204) return null;
-  return res.json();
-}
+let yapActive = false;       // whether the yap loop is running
+let yapIndex = 0;            // current position in ALL_MESSAGES (0-based)
+let yapChannelId = null;     // channel ID where !on was issued
+let yapTimeout = null;       // handle for the scheduled next message
 
-function sendMessage(channelId, content) {
-  return discordRequest("POST", `/channels/${channelId}/messages`, { content });
-}
+// ─── Yap feature ─────────────────────────────────────────────────────────────
+// Each tick, ONE randomly chosen client sends the message so it looks natural.
+// All clients are passed in so we can pick one at random.
+let allClients = [];
 
-function addReaction(channelId, messageId, emoji) {
-  // emoji must be URL-encoded "name:id" for custom or just "name" for unicode
-  const encoded = encodeURIComponent(emoji);
-  return discordRequest("PUT", `/channels/${channelId}/messages/${messageId}/reactions/${encoded}/@me`, null);
-}
-
-// ─── Auto-reactor state ───────────────────────────────────────────────────────
-const handled = new Set();
-
-// ─── Yap feature state ────────────────────────────────────────────────────────
-let yapActive = false;    // whether the yap loop is running
-let yapIndex = 0;         // current position in ALL_MESSAGES (0-based)
-let yapChannelId = null;  // channel ID where !on was issued
-let yapTimeout = null;    // handle for the scheduled next message
-
-// Schedule the next yap message; wraps back to 0 after all messages are sent
 function scheduleNextYap() {
   if (!yapActive) return;
   yapTimeout = setTimeout(async () => {
@@ -61,26 +45,33 @@ function scheduleNextYap() {
     const msgNumber = yapIndex + 1; // 1-based for logging
     const content = ALL_MESSAGES[yapIndex];
     console.log(`💬 Yap #${msgNumber} → channel ${yapChannelId}`);
-    try {
-      await sendMessage(yapChannelId, content);
-    } catch (err) {
-      console.error("❌ Yap send failed:", err.message);
+
+    // Pick a random live client to send the message
+    const live = allClients.filter((c) => c.isReady());
+    if (live.length > 0) {
+      const sender = live[Math.floor(Math.random() * live.length)];
+      try {
+        await sender.sendMessage(yapChannelId, content);
+      } catch (err) {
+        console.error("❌ Yap send failed:", err.message);
+      }
+    } else {
+      console.warn("⚠️ No live clients available to send yap message");
     }
-    yapIndex = (yapIndex + 1) % ALL_MESSAGES.length; // cycle back after all messages
+
+    yapIndex = (yapIndex + 1) % ALL_MESSAGES.length;
     scheduleNextYap();
   }, yapDelay);
 }
 
-// Start the yap loop in the given channel
 function startYap(channelId) {
-  if (yapActive) return; // already running
+  if (yapActive) return;
   yapActive = true;
   yapChannelId = channelId;
   console.log(`🟢 Yap started in channel ${channelId} from message ${yapIndex + 1}`);
   scheduleNextYap();
 }
 
-// Stop the yap loop
 function stopYap() {
   if (!yapActive) return;
   yapActive = false;
@@ -91,10 +82,10 @@ function stopYap() {
   console.log(`🔴 Yap stopped at message ${yapIndex + 1}`);
 }
 
-// ─── Discord Gateway (WebSocket) ──────────────────────────────────────────────
+// ─── Gateway constants ────────────────────────────────────────────────────────
 const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
+const API_BASE = "https://discord.com/api/v10";
 
-// Op codes
 const OP = {
   DISPATCH: 0,
   HEARTBEAT: 1,
@@ -106,256 +97,308 @@ const OP = {
   HEARTBEAT_ACK: 11,
 };
 
-let ws = null;
-let heartbeatInterval = null;
-let lastSequence = null;
-let sessionId = null;
-let resumeGatewayUrl = null;
-let heartbeatAcked = true;
-let currentUserId = null;
+// ─── DiscordClient class ──────────────────────────────────────────────────────
+class DiscordClient {
+  constructor(token, index) {
+    this.token = token;
+    this.index = index;          // for log prefixes
+    this.tag = `[Account ${index + 1}]`;
 
-function sendGateway(payload) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(payload));
+    // Gateway state
+    this.ws = null;
+    this.heartbeatInterval = null;
+    this.lastSequence = null;
+    this.sessionId = null;
+    this.resumeGatewayUrl = null;
+    this.heartbeatAcked = true;
+    this.currentUserId = null;
+    this.ready = false;
   }
-}
 
-function startHeartbeat(intervalMs) {
-  if (heartbeatInterval) clearInterval(heartbeatInterval);
-  heartbeatAcked = true;
-  heartbeatInterval = setInterval(() => {
-    if (!heartbeatAcked) {
-      console.warn("⚠️ Heartbeat not acknowledged — reconnecting");
-      ws.terminate();
-      return;
-    }
-    heartbeatAcked = false;
-    sendGateway({ op: OP.HEARTBEAT, d: lastSequence });
-  }, intervalMs);
-}
+  // ── Public helpers ──────────────────────────────────────────────────────────
+  isReady() {
+    return this.ready && this.ws && this.ws.readyState === WebSocket.OPEN;
+  }
 
-function identify() {
-  sendGateway({
-    op: OP.IDENTIFY,
-    d: {
-      token: TOKEN,
-      // User account properties (not bot)
-      properties: {
-        os: "linux",
-        browser: "Chrome",
-        device: "",
+  // ── REST helpers ────────────────────────────────────────────────────────────
+  async discordRequest(method, path, body) {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers: {
+        Authorization: this.token,
+        "Content-Type": "application/json",
+        "User-Agent": "DiscordBot (custom, 1.0)",
       },
-      intents:
-        (1 << 9) |  // GUILD_MESSAGES
-        (1 << 10) | // GUILD_MESSAGE_REACTIONS
-        (1 << 15),  // MESSAGE_CONTENT
-      presence: {
-        status: "online",
-        activities: [
-          {
-            name: "the chat 👀",
-            type: 3, // Watching
-          },
-        ],
-        since: null,
-        afk: false,
-      },
-    },
-  });
-}
-
-function resume() {
-  sendGateway({
-    op: OP.RESUME,
-    d: {
-      token: TOKEN,
-      session_id: sessionId,
-      seq: lastSequence,
-    },
-  });
-}
-
-function connect(url) {
-  console.log(`🔌 Connecting to gateway: ${url}`);
-  ws = new WebSocket(url || GATEWAY_URL);
-
-  ws.on("open", () => {
-    console.log("🌐 Gateway connection opened");
-  });
-
-  ws.on("message", (data) => {
-    let payload;
-    try {
-      payload = JSON.parse(data);
-    } catch {
-      return;
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Discord API ${method} ${path} → ${res.status}: ${text}`);
     }
+    if (res.status === 204) return null;
+    return res.json();
+  }
 
-    const { op, d, s, t } = payload;
+  sendMessage(channelId, content) {
+    return this.discordRequest("POST", `/channels/${channelId}/messages`, { content });
+  }
 
-    if (s !== null && s !== undefined) lastSequence = s;
+  addReaction(channelId, messageId, emoji) {
+    const encoded = encodeURIComponent(emoji);
+    return this.discordRequest(
+      "PUT",
+      `/channels/${channelId}/messages/${messageId}/reactions/${encoded}/@me`,
+      null
+    );
+  }
 
-    switch (op) {
-      case OP.HELLO: {
-        startHeartbeat(d.heartbeat_interval);
-        // Send first heartbeat immediately with a jitter
-        setTimeout(() => {
-          sendGateway({ op: OP.HEARTBEAT, d: lastSequence });
-        }, Math.random() * d.heartbeat_interval);
+  // ── Gateway ─────────────────────────────────────────────────────────────────
+  sendGateway(payload) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(payload));
+    }
+  }
 
-        if (sessionId && resumeGatewayUrl) {
-          console.log("🔄 Resuming session...");
-          resume();
-        } else {
-          identify();
+  startHeartbeat(intervalMs) {
+    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+    this.heartbeatAcked = true;
+    this.heartbeatInterval = setInterval(() => {
+      if (!this.heartbeatAcked) {
+        console.warn(`${this.tag} ⚠️ Heartbeat not acknowledged — reconnecting`);
+        this.ws.terminate();
+        return;
+      }
+      this.heartbeatAcked = false;
+      this.sendGateway({ op: OP.HEARTBEAT, d: this.lastSequence });
+    }, intervalMs);
+  }
+
+  identify() {
+    this.sendGateway({
+      op: OP.IDENTIFY,
+      d: {
+        token: this.token,
+        properties: {
+          os: "linux",
+          browser: "Chrome",
+          device: "",
+        },
+        intents:
+          (1 << 9) |  // GUILD_MESSAGES
+          (1 << 10) | // GUILD_MESSAGE_REACTIONS
+          (1 << 15),  // MESSAGE_CONTENT
+        presence: {
+          status: "online",
+          activities: [
+            {
+              name: "the chat 👀",
+              type: 3, // Watching
+            },
+          ],
+          since: null,
+          afk: false,
+        },
+      },
+    });
+  }
+
+  resume() {
+    this.sendGateway({
+      op: OP.RESUME,
+      d: {
+        token: this.token,
+        session_id: this.sessionId,
+        seq: this.lastSequence,
+      },
+    });
+  }
+
+  connect(url) {
+    const target = url || GATEWAY_URL;
+    console.log(`${this.tag} 🔌 Connecting to gateway: ${target}`);
+    this.ws = new WebSocket(target);
+
+    this.ws.on("open", () => {
+      console.log(`${this.tag} 🌐 Gateway connection opened`);
+    });
+
+    this.ws.on("message", (data) => {
+      let payload;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        return;
+      }
+
+      const { op, d, s, t } = payload;
+
+      if (s !== null && s !== undefined) this.lastSequence = s;
+
+      switch (op) {
+        case OP.HELLO: {
+          this.startHeartbeat(d.heartbeat_interval);
+          // Jittered first heartbeat
+          setTimeout(() => {
+            this.sendGateway({ op: OP.HEARTBEAT, d: this.lastSequence });
+          }, Math.random() * d.heartbeat_interval);
+
+          if (this.sessionId && this.resumeGatewayUrl) {
+            console.log(`${this.tag} 🔄 Resuming session...`);
+            this.resume();
+          } else {
+            this.identify();
+          }
+          break;
         }
+
+        case OP.HEARTBEAT_ACK: {
+          this.heartbeatAcked = true;
+          break;
+        }
+
+        case OP.HEARTBEAT: {
+          this.sendGateway({ op: OP.HEARTBEAT, d: this.lastSequence });
+          break;
+        }
+
+        case OP.RECONNECT: {
+          console.log(`${this.tag} 🔄 Gateway requested reconnect`);
+          this.ws.close();
+          break;
+        }
+
+        case OP.INVALID_SESSION: {
+          console.warn(`${this.tag} ⚠️ Invalid session, re-identifying in 5s...`);
+          this.sessionId = null;
+          this.resumeGatewayUrl = null;
+          setTimeout(() => this.identify(), 5000);
+          break;
+        }
+
+        case OP.DISPATCH: {
+          this.handleDispatch(t, d);
+          break;
+        }
+      }
+    });
+
+    this.ws.on("close", (code, reason) => {
+      this.ready = false;
+      console.warn(`${this.tag} 🔌 Gateway closed (${code}): ${reason}`);
+      if (this.heartbeatInterval) {
+        clearInterval(this.heartbeatInterval);
+        this.heartbeatInterval = null;
+      }
+      const reconnectUrl = this.resumeGatewayUrl || GATEWAY_URL;
+      setTimeout(() => this.connect(reconnectUrl), 5000);
+    });
+
+    this.ws.on("error", (err) => {
+      console.error(`${this.tag} ❌ Gateway error:`, err.message);
+    });
+  }
+
+  // ── Dispatch handler ────────────────────────────────────────────────────────
+  handleDispatch(event, data) {
+    switch (event) {
+      case "READY": {
+        this.ready = true;
+        this.currentUserId = data.user.id;
+        this.sessionId = data.session_id;
+        this.resumeGatewayUrl = data.resume_gateway_url;
+        console.log(`${this.tag} 🚀 Logged in as ${data.user.username}#${data.user.discriminator}`);
+        console.log(`${this.tag} 👀 Watching channel ${CHANNEL_ID}`);
+        console.log(`${this.tag} 💬 Yap ready — !on to start, !off to stop (delay: ${yapDelay}ms)`);
         break;
       }
 
-      case OP.HEARTBEAT_ACK: {
-        heartbeatAcked = true;
+      case "RESUMED": {
+        this.ready = true;
+        console.log(`${this.tag} ✅ Session resumed`);
         break;
       }
 
-      case OP.HEARTBEAT: {
-        // Server requested a heartbeat
-        sendGateway({ op: OP.HEARTBEAT, d: lastSequence });
+      case "MESSAGE_CREATE": {
+        this.handleMessageCreate(data);
         break;
       }
 
-      case OP.RECONNECT: {
-        console.log("🔄 Gateway requested reconnect");
-        ws.close();
-        break;
-      }
-
-      case OP.INVALID_SESSION: {
-        console.warn("⚠️ Invalid session, re-identifying in 5s...");
-        sessionId = null;
-        resumeGatewayUrl = null;
-        setTimeout(() => identify(), 5000);
-        break;
-      }
-
-      case OP.DISPATCH: {
-        handleDispatch(t, d);
+      case "MESSAGE_REACTION_ADD": {
+        this.handleReactionAdd(data);
         break;
       }
     }
-  });
+  }
 
-  ws.on("close", (code, reason) => {
-    console.warn(`🔌 Gateway closed (${code}): ${reason}`);
-    if (heartbeatInterval) {
-      clearInterval(heartbeatInterval);
-      heartbeatInterval = null;
+  // ── Message event — commands ────────────────────────────────────────────────
+  async handleMessageCreate(message) {
+    if (message.author && message.author.bot) return;
+
+    const text = (message.content || "").trim().toLowerCase();
+
+    if (text === "!on") {
+      console.log(`${this.tag} 📥 !on received from ${message.author.username}`);
+      startYap(message.channel_id);
+    } else if (text === "!off") {
+      console.log(`${this.tag} 📥 !off received from ${message.author.username}`);
+      stopYap();
+    } else if (text.startsWith("!cooldown ")) {
+      const arg = text.slice("!cooldown ".length).trim();
+      const seconds = parseInt(arg, 10);
+      if (!Number.isInteger(seconds) || seconds <= 0 || String(seconds) !== arg) {
+        console.log(`${this.tag} ⚠️ Invalid !cooldown value from ${message.author.username}: "${arg}"`);
+        try {
+          await this.sendMessage(
+            message.channel_id,
+            `❌ Invalid cooldown. Usage: \`!cooldown <positive integer>\` (seconds)`
+          );
+        } catch (err) {
+          console.error(`${this.tag} ❌ Failed to send cooldown error message:`, err.message);
+        }
+      } else {
+        yapDelay = seconds * 1000;
+        console.log(`${this.tag} ⏱️ Cooldown updated to ${seconds}s (${yapDelay}ms) by ${message.author.username}`);
+        try {
+          await this.sendMessage(
+            message.channel_id,
+            `✅ Cooldown set to **${seconds} seconds**. Applies to the next scheduled message.`
+          );
+        } catch (err) {
+          console.error(`${this.tag} ❌ Failed to send cooldown confirmation:`, err.message);
+        }
+      }
     }
-    // Reconnect after a short delay
-    const reconnectUrl = resumeGatewayUrl || GATEWAY_URL;
-    setTimeout(() => connect(reconnectUrl), 5000);
-  });
+  }
 
-  ws.on("error", (err) => {
-    console.error("❌ Gateway error:", err.message);
-  });
-}
+  // ── Reaction event — auto-reactor ───────────────────────────────────────────
+  async handleReactionAdd(data) {
+    // Only mirror reactions in the watched channel
+    if (data.channel_id !== CHANNEL_ID) return;
+    // Don't react to our own reactions
+    if (data.user_id === this.currentUserId) return;
 
-// ─── Dispatch event handler ───────────────────────────────────────────────────
-function handleDispatch(event, data) {
-  switch (event) {
-    case "READY": {
-      currentUserId = data.user.id;
-      sessionId = data.session_id;
-      resumeGatewayUrl = data.resume_gateway_url;
-      console.log(`🚀 Logged in as ${data.user.username}#${data.user.discriminator}`);
-      console.log(`👀 Watching channel ${CHANNEL_ID}`);
-      console.log(`💬 Yap feature ready — send !on to start, !off to stop (delay: ${yapDelay}ms)`);
-      break;
-    }
+    const emoji = data.emoji;
+    const emojiKey = emoji.id ? `${emoji.name}:${emoji.id}` : emoji.name;
+    const comboKey = `${data.message_id}:${emojiKey}`;
 
-    case "RESUMED": {
-      console.log("✅ Session resumed");
-      break;
-    }
+    // Shared handled set prevents any account from double-reacting
+    if (handled.has(comboKey)) return;
+    handled.add(comboKey);
 
-    case "MESSAGE_CREATE": {
-      handleMessageCreate(data);
-      break;
-    }
+    const emojiStr = emoji.id ? `${emoji.name}:${emoji.id}` : emoji.name;
 
-    case "MESSAGE_REACTION_ADD": {
-      handleReactionAdd(data);
-      break;
+    try {
+      await this.addReaction(data.channel_id, data.message_id, emojiStr);
+      console.log(`${this.tag} ✅ Reacted ${emoji.name} on message ${data.message_id}`);
+    } catch (err) {
+      console.error(`${this.tag} ❌ Failed to react ${emoji.name}:`, err.message);
+      handled.delete(comboKey); // allow retry next time
     }
   }
 }
 
-// ─── Message event — commands ─────────────────────────────────────────────────
-async function handleMessageCreate(message) {
-  // Ignore messages from bots (including ourselves if we're a bot)
-  if (message.author && message.author.bot) return;
+// ─── Start — spin up one client per token ────────────────────────────────────
+console.log(`🚀 Starting ${TOKENS.length} Discord client(s)...`);
 
-  const text = (message.content || "").trim().toLowerCase();
-
-  if (text === "!on") {
-    console.log(`📥 !on received from ${message.author.username}`);
-    startYap(message.channel_id);
-  } else if (text === "!off") {
-    console.log(`📥 !off received from ${message.author.username}`);
-    stopYap();
-  } else if (text.startsWith("!cooldown ")) {
-    const arg = text.slice("!cooldown ".length).trim();
-    const seconds = parseInt(arg, 10);
-    if (!Number.isInteger(seconds) || seconds <= 0 || String(seconds) !== arg) {
-      console.log(`⚠️ Invalid !cooldown value from ${message.author.username}: "${arg}"`);
-      try {
-        await sendMessage(
-          message.channel_id,
-          `❌ Invalid cooldown. Usage: \`!cooldown <positive integer>\` (seconds)`
-        );
-      } catch (err) {
-        console.error("❌ Failed to send cooldown error message:", err.message);
-      }
-    } else {
-      yapDelay = seconds * 1000;
-      console.log(`⏱️ Cooldown updated to ${seconds}s (${yapDelay}ms) by ${message.author.username}`);
-      try {
-        await sendMessage(
-          message.channel_id,
-          `✅ Cooldown set to **${seconds} seconds**. Applies to the next scheduled message.`
-        );
-      } catch (err) {
-        console.error("❌ Failed to send cooldown confirmation:", err.message);
-      }
-    }
-  }
-}
-
-// ─── Reaction event — auto-reactor ───────────────────────────────────────────
-async function handleReactionAdd(data) {
-  // Only mirror reactions in the watched channel
-  if (data.channel_id !== CHANNEL_ID) return;
-  // Don't react to our own reactions
-  if (data.user_id === currentUserId) return;
-
-  const emoji = data.emoji;
-  const emojiKey = emoji.id ? `${emoji.name}:${emoji.id}` : emoji.name;
-  const comboKey = `${data.message_id}:${emojiKey}`;
-
-  if (handled.has(comboKey)) return;
-  handled.add(comboKey);
-
-  // Build the emoji string for the API: "name:id" for custom, "name" for unicode
-  const emojiStr = emoji.id ? `${emoji.name}:${emoji.id}` : emoji.name;
-
-  try {
-    await addReaction(data.channel_id, data.message_id, emojiStr);
-    console.log(`✅ Reacted ${emoji.name} on message ${data.message_id}`);
-  } catch (err) {
-    console.error(`❌ Failed to react ${emoji.name}:`, err.message);
-    handled.delete(comboKey); // allow retry next time
-  }
-}
-
-// ─── Start ────────────────────────────────────────────────────────────────────
-connect(GATEWAY_URL);
+allClients = TOKENS.map((token, i) => new DiscordClient(token, i));
+allClients.forEach((client) => client.connect());
