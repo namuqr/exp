@@ -1,6 +1,7 @@
+const { Client, GatewayIntentBits, ActivityType } = require("discord.js");
+
 const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
-const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || "4000", 10);
 // Delay between each yap message in milliseconds (default: 30 seconds)
 let yapDelay = parseInt(process.env.YAP_DELAY || "30000", 10);
 
@@ -11,56 +12,49 @@ if (!TOKEN || !CHANNEL_ID) {
 
 const { ALL_MESSAGES } = require("./messages.js");
 
+// ─── Discord client ───────────────────────────────────────────────────────────
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.MessageContent,
+  ],
+});
+
 // ─── Auto-reactor state ───────────────────────────────────────────────────────
 const handled = new Set();
 
 // ─── Yap feature state ────────────────────────────────────────────────────────
-let yapActive = false;       // whether the yap loop is running
-let yapIndex = 0;            // current position in ALL_MESSAGES (0-based)
-let yapChannelId = null;     // channel where !on was issued
-let yapTimeout = null;       // handle for the scheduled next message
-let lastCommandMsgId = null; // track the most recent !on / !off we've seen
+let yapActive = false;    // whether the yap loop is running
+let yapIndex = 0;         // current position in ALL_MESSAGES (0-based)
+let yapChannel = null;    // discord.js TextChannel where !on was issued
+let yapTimeout = null;    // handle for the scheduled next message
 
-// Send a single Discord message to a channel via the REST API
-async function sendMessage(channelId, content) {
-  const res = await fetch(
-    `https://discord.com/api/v9/channels/${channelId}/messages`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: TOKEN,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ content }),
-    }
-  );
-  if (!res.ok) {
-    const text = await res.text();
-    console.error(`❌ sendMessage failed (${res.status}): ${text}`);
-  }
-  return res;
-}
-
-// Schedule the next yap message; wraps back to 0 after all 100 are sent
+// Schedule the next yap message; wraps back to 0 after all messages are sent
 function scheduleNextYap() {
   if (!yapActive) return;
   yapTimeout = setTimeout(async () => {
     if (!yapActive) return;
     const msgNumber = yapIndex + 1; // 1-based for logging
     const content = ALL_MESSAGES[yapIndex];
-    console.log(`💬 Yap #${msgNumber} → channel ${yapChannelId}`);
-    await sendMessage(yapChannelId, content);
-    yapIndex = (yapIndex + 1) % ALL_MESSAGES.length; // cycle back after 100
+    console.log(`💬 Yap #${msgNumber} → channel ${yapChannel.id}`);
+    try {
+      await yapChannel.send(content);
+    } catch (err) {
+      console.error("❌ Yap send failed:", err.message);
+    }
+    yapIndex = (yapIndex + 1) % ALL_MESSAGES.length; // cycle back after all messages
     scheduleNextYap();
   }, yapDelay);
 }
 
 // Start the yap loop in the given channel
-function startYap(channelId) {
+function startYap(channel) {
   if (yapActive) return; // already running
   yapActive = true;
-  yapChannelId = channelId;
-  console.log(`🟢 Yap started in channel ${channelId} from message ${yapIndex + 1}`);
+  yapChannel = channel;
+  console.log(`🟢 Yap started in channel ${channel.id} from message ${yapIndex + 1}`);
   scheduleNextYap();
 }
 
@@ -75,134 +69,85 @@ function stopYap() {
   console.log(`🔴 Yap stopped at message ${yapIndex + 1}`);
 }
 
-// ─── Command polling ──────────────────────────────────────────────────────────
-// Watches for !on / !off commands in any channel the bot can read.
-// We track the latest message ID we've processed so we only act on new ones.
-let lastSeenCommandId = null;
+// ─── Ready event ──────────────────────────────────────────────────────────────
+client.once("ready", () => {
+  console.log(`🚀 Logged in as ${client.user.tag}`);
+  console.log(`👀 Watching channel ${CHANNEL_ID}`);
+  console.log(`💬 Yap feature ready — send !on to start, !off to stop (delay: ${yapDelay}ms)`);
 
-async function pollCommands() {
-  try {
-    const url = lastSeenCommandId
-      ? `https://discord.com/api/v9/channels/${CHANNEL_ID}/messages?limit=10&after=${lastSeenCommandId}`
-      : `https://discord.com/api/v9/channels/${CHANNEL_ID}/messages?limit=10`;
+  client.user.setPresence({
+    status: "online",
+    activities: [
+      {
+        name: "the chat 👀",
+        type: ActivityType.Watching,
+      },
+    ],
+  });
+});
 
-    const res = await fetch(url, { headers: { Authorization: TOKEN } });
-    if (!res.ok) {
-      console.error(`Command poll failed: ${res.status}`);
-      return;
+// ─── Message event — commands ─────────────────────────────────────────────────
+client.on("messageCreate", async (message) => {
+  // Ignore messages from bots (including ourselves)
+  if (message.author.bot) return;
+
+  const text = (message.content || "").trim().toLowerCase();
+
+  if (text === "!on") {
+    console.log(`📥 !on received from ${message.author.username}`);
+    startYap(message.channel);
+  } else if (text === "!off") {
+    console.log(`📥 !off received from ${message.author.username}`);
+    stopYap();
+  } else if (text.startsWith("!cooldown ")) {
+    const arg = text.slice("!cooldown ".length).trim();
+    const seconds = parseInt(arg, 10);
+    if (!Number.isInteger(seconds) || seconds <= 0 || String(seconds) !== arg) {
+      console.log(`⚠️ Invalid !cooldown value from ${message.author.username}: "${arg}"`);
+      await message.channel.send(
+        `❌ Invalid cooldown. Usage: \`!cooldown <positive integer>\` (seconds)`
+      );
+    } else {
+      yapDelay = seconds * 1000;
+      console.log(`⏱️ Cooldown updated to ${seconds}s (${yapDelay}ms) by ${message.author.username}`);
+      await message.channel.send(
+        `✅ Cooldown set to **${seconds} seconds**. Applies to the next scheduled message.`
+      );
     }
-
-    const messages = await res.json();
-    if (!Array.isArray(messages) || messages.length === 0) return;
-
-    // Discord returns newest-first; reverse so we process oldest → newest
-    const ordered = [...messages].reverse();
-
-    for (const msg of ordered) {
-      // Always advance our cursor so we don't re-process
-      if (!lastSeenCommandId || BigInt(msg.id) > BigInt(lastSeenCommandId)) {
-        lastSeenCommandId = msg.id;
-      }
-
-      const text = (msg.content || "").trim().toLowerCase();
-
-      if (text === "!on") {
-        console.log(`📥 !on received from ${msg.author.username}`);
-        startYap(msg.channel_id);
-      } else if (text === "!off") {
-        console.log(`📥 !off received from ${msg.author.username}`);
-        stopYap();
-      } else if (text.startsWith("!cooldown ")) {
-        const arg = text.slice("!cooldown ".length).trim();
-        const seconds = parseInt(arg, 10);
-        if (!Number.isInteger(seconds) || seconds <= 0 || String(seconds) !== arg) {
-          console.log(`⚠️ Invalid !cooldown value from ${msg.author.username}: "${arg}"`);
-          await sendMessage(msg.channel_id, `❌ Invalid cooldown. Usage: \`!cooldown <positive integer>\` (seconds)`);
-        } else {
-          yapDelay = seconds * 1000;
-          console.log(`⏱️ Cooldown updated to ${seconds}s (${yapDelay}ms) by ${msg.author.username}`);
-          await sendMessage(msg.channel_id, `✅ Cooldown set to **${seconds} seconds**. Applies to the next scheduled message.`);
-        }
-      }
-    }
-  } catch (err) {
-    console.error("Command poll error:", err.message);
   }
-}
+});
 
-// ─── Auto-reactor ─────────────────────────────────────────────────────────────
-async function poll() {
+// ─── Reaction event — auto-reactor ───────────────────────────────────────────
+client.on("messageReactionAdd", async (reaction, user) => {
+  // Only mirror reactions in the watched channel
+  if (reaction.message.channelId !== CHANNEL_ID) return;
+  // Don't react to our own reactions
+  if (user.id === client.user.id) return;
+
+  // Fetch partial reaction/message if needed
   try {
-    const res = await fetch(
-      `https://discord.com/api/v9/channels/${CHANNEL_ID}/messages?limit=50`,
-      { headers: { Authorization: TOKEN } }
-    );
-
-    if (!res.ok) {
-      console.error(`Fetch messages failed: ${res.status}`);
-      return;
-    }
-
-    const messages = await res.json();
-
-    for (const msg of messages) {
-      if (!msg.reactions) continue;
-      for (const r of msg.reactions) {
-        if (r.me) continue;
-
-        const emojiKey = r.emoji.id
-          ? `${r.emoji.name}:${r.emoji.id}`
-          : r.emoji.name;
-        const comboKey = `${msg.id}:${emojiKey}`;
-
-        if (handled.has(comboKey)) continue;
-
-        const encoded = r.emoji.id
-          ? `${encodeURIComponent(r.emoji.name)}:${r.emoji.id}`
-          : encodeURIComponent(r.emoji.name);
-
-        const reactRes = await fetch(
-          `https://discord.com/api/v9/channels/${CHANNEL_ID}/messages/${msg.id}/reactions/${encoded}/@me`,
-          { method: "PUT", headers: { Authorization: TOKEN } }
-        );
-
-        if (reactRes.ok || reactRes.status === 204) {
-          console.log(`✅ Reacted ${r.emoji.name} on msg from ${msg.author.username}`);
-          handled.add(comboKey);
-        } else {
-          console.log(`❌ Failed ${r.emoji.name}: ${reactRes.status}`);
-        }
-
-        // One reaction per poll cycle to respect rate limits
-        return;
-      }
-    }
+    if (reaction.partial) await reaction.fetch();
+    if (reaction.message.partial) await reaction.message.fetch();
   } catch (err) {
-    console.error("Poll error:", err.message);
+    console.error("❌ Failed to fetch reaction/message:", err.message);
+    return;
   }
-}
 
-// ─── Bootstrap ────────────────────────────────────────────────────────────────
-console.log(`🚀 Auto-reactor started — watching channel ${CHANNEL_ID}`);
-console.log(`💬 Yap feature ready — send !on to start, !off to stop (delay: ${yapDelay}ms)`);
+  const emoji = reaction.emoji;
+  const emojiKey = emoji.id ? `${emoji.name}:${emoji.id}` : emoji.name;
+  const comboKey = `${reaction.message.id}:${emojiKey}`;
 
-// Seed lastSeenCommandId with the latest message so we don't replay history
-(async () => {
+  if (handled.has(comboKey)) return;
+  handled.add(comboKey);
+
   try {
-    const res = await fetch(
-      `https://discord.com/api/v9/channels/${CHANNEL_ID}/messages?limit=1`,
-      { headers: { Authorization: TOKEN } }
-    );
-    if (res.ok) {
-      const msgs = await res.json();
-      if (msgs.length > 0) lastSeenCommandId = msgs[0].id;
-    }
-  } catch (_) {}
+    await reaction.message.react(emoji.id ? emoji : emoji.name);
+    console.log(`✅ Reacted ${emoji.name} on msg from ${reaction.message.author?.username ?? "unknown"}`);
+  } catch (err) {
+    console.error(`❌ Failed to react ${emoji.name}:`, err.message);
+    handled.delete(comboKey); // allow retry next time
+  }
+});
 
-  // Start both polling loops
-  setInterval(poll, POLL_INTERVAL);
-  setInterval(pollCommands, POLL_INTERVAL);
-  poll();
-  pollCommands();
-})();
-
+// ─── Login ────────────────────────────────────────────────────────────────────
+client.login(TOKEN);
