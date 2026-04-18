@@ -1,6 +1,6 @@
 # Discord Auto-Reactor
 
-Automatically clicks existing reactions in a Discord channel.
+Automatically mirrors reactions and sends yap messages across multiple Discord user accounts simultaneously.
 
 ## Deploy to Railway
 
@@ -8,14 +8,18 @@ Automatically clicks existing reactions in a Discord channel.
 2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub Repo
 3. Select the repo
 4. Go to **Variables** tab and add:
-   - `DISCORD_TOKEN` — your Discord authorization token
-   - `CHANNEL_ID` — the channel to watch
-   - `POLL_INTERVAL` — (optional) poll interval in ms, default 4000
-5. Railway will auto-deploy and keep it running 24/7
+   - `DISCORD_TOKENS` — JSON array of Discord user authorization tokens
+     ```
+     ["token1","token2","token3"]
+     ```
+   - `CHANNEL_ID` — the channel to watch for reactions and commands
+   - `YAP_DELAY` — (optional) delay between yap messages in ms, default `30000`
+5. Railway will auto-deploy and keep all accounts running 24/7
 
 ## How it works
 
-- Polls the channel every 4 seconds for messages with reactions
-- If it finds a reaction you haven't added yet, it adds it as you
-- Processes one reaction per poll cycle to stay within Discord rate limits
-- Tracks handled reactions in memory (resets on restart)
+- Spins up one WebSocket gateway connection per token — all accounts connect simultaneously
+- **Auto-reactor:** when any reaction appears in the watched channel, every account adds the same reaction; a shared `handled` set ensures no account reacts twice to the same message+emoji combo
+- **Yap (`!on` / `!off`):** starts/stops a message loop; each message is sent by a randomly chosen live account so activity looks natural across accounts
+- **`!cooldown <seconds>`:** updates the delay between yap messages at runtime
+- All accounts maintain a persistent `online` presence with automatic reconnect and session resume
